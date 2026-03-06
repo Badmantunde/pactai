@@ -1,0 +1,262 @@
+// Pactai — Prisma Schema
+// All monetary amounts are stored in the smallest currency unit (e.g. kobo, cents).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum ProjectStatus {
+  DRAFT
+  ACTIVE
+  FUNDED
+  IN_PROGRESS
+  PENDING_APPROVAL
+  COMPLETED
+  DISPUTE
+  CANCELLED
+}
+
+enum PaymentType {
+  FULL
+  MILESTONE
+}
+
+enum EscrowStatus {
+  UNFUNDED
+  FUNDED
+  PARTIALLY_RELEASED
+  FULLY_RELEASED
+}
+
+enum MilestoneStatus {
+  PENDING
+  SUBMITTED
+  APPROVED
+  RELEASED
+  DISPUTED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  CANCELLED
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  CLOSED
+}
+
+enum PayrollStatus {
+  DRAFT
+  CONFIRMED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum AuditAction {
+  PROJECT_CREATED
+  PROJECT_FUNDED
+  PROJECT_COMPLETED
+  PROJECT_CANCELLED
+  MILESTONE_SUBMITTED
+  MILESTONE_APPROVED
+  MILESTONE_REVISION_REQUESTED
+  ESCROW_FUNDED
+  ESCROW_LOCKED
+  ESCROW_PARTIALLY_RELEASED
+  ESCROW_FULLY_RELEASED
+  INVOICE_CREATED
+  INVOICE_SENT
+  INVOICE_PAID
+  DISPUTE_OPENED
+  DISPUTE_STATEMENT_RECEIVED
+  DISPUTE_RESOLVED
+  PAYROLL_CREATED
+  PAYROLL_CONFIRMED
+  PAYROLL_PROCESSED
+  CONFIRMATION_REQUESTED
+  CONFIRMATION_RECEIVED
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model Project {
+  id              String        @id @default(cuid())
+  name            String
+  clientPhone     String
+  freelancerName  String
+  freelancerPhone String?
+  totalAmount     Int           // smallest currency unit
+  currency        String        @default("NGN")
+  paymentType     PaymentType
+  deadline        DateTime
+  escrowRequired  Boolean       @default(true)
+  status          ProjectStatus @default(DRAFT)
+  groupChatId     String?       // WhatsApp group chat ID
+  invoiceId       String?
+
+  milestones Milestone[]
+  invoices   Invoice[]
+  escrow     Escrow?
+  disputes   Dispute[]
+  auditLogs  AuditLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientPhone])
+  @@index([groupChatId])
+  @@index([status])
+}
+
+model Milestone {
+  id          String          @id @default(cuid())
+  projectId   String
+  project     Project         @relation(fields: [projectId], references: [id])
+  title       String
+  description String?
+  amount      Int             // smallest currency unit
+  dueDate     DateTime?
+  status      MilestoneStatus @default(PENDING)
+  order       Int
+
+  deliverables String[]        // array of submission notes/links
+  approvedAt   DateTime?
+  releasedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+}
+
+model Escrow {
+  id        String       @id @default(cuid())
+  projectId String       @unique
+  project   Project      @relation(fields: [projectId], references: [id])
+  amount    Int
+  currency  String       @default("NGN")
+  status    EscrowStatus @default(UNFUNDED)
+
+  fundedAt          DateTime?
+  lockedAt          DateTime?
+  lastReleasedAt    DateTime?
+  fullyReleasedAt   DateTime?
+  amountReleased    Int       @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Invoice {
+  id          String        @id @default(cuid())
+  invoiceCode String        @unique // human-readable, e.g. INV-20240101-ABC
+  projectId   String
+  project     Project       @relation(fields: [projectId], references: [id])
+  amount      Int
+  currency    String        @default("NGN")
+  isMilestone Boolean       @default(false)
+  milestoneId String?
+  dueDate     DateTime
+  paymentLink String?
+  status      InvoiceStatus @default(DRAFT)
+  sentAt      DateTime?
+  paidAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+}
+
+model Dispute {
+  id              String        @id @default(cuid())
+  projectId       String
+  project         Project       @relation(fields: [projectId], references: [id])
+  status          DisputeStatus @default(OPEN)
+  clientStatement String?
+  freelancerStatement String?
+  adminNotes      String?
+  timeline        Json?         // serialized event timeline
+  resolvedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+}
+
+model PayrollBatch {
+  id        String       @id @default(cuid())
+  batchCode String       @unique // e.g. PAY-20240101-XYZ
+  initiator String       // WhatsApp number of person who ran payroll
+  chatId    String       // must be private chat
+  currency  String       @default("NGN")
+  totalAmount Int
+  status    PayrollStatus @default(DRAFT)
+
+  entries   PayrollEntry[]
+
+  confirmedAt  DateTime?
+  processedAt  DateTime?
+  completedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PayrollEntry {
+  id           String       @id @default(cuid())
+  batchId      String
+  batch        PayrollBatch @relation(fields: [batchId], references: [id])
+  recipientName String
+  amount       Int
+  accountNumber String
+  bankName     String
+  reference    String?
+  status       String       @default("PENDING") // PENDING | SENT | FAILED
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([batchId])
+}
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  projectId String?
+  project   Project?    @relation(fields: [projectId], references: [id])
+  actor     String      // WhatsApp number or "SYSTEM"
+  action    AuditAction
+  details   Json?       // structured context
+  chatId    String?
+
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+  @@index([actor])
+  @@index([createdAt])
+}
+
+// Stores per-chat conversation context for the Claude agent
+model ChatSession {
+  id        String   @id @default(cuid())
+  chatId    String   @unique
+  projectId String?  // active project for this chat
+  state     String   @default("IDLE") // IDLE | COLLECTING_PROJECT | COLLECTING_PAYROLL | etc.
+  context   Json?    // partial collected data during multi-step flows
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
