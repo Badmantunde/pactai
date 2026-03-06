@@ -38,12 +38,16 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     update: {},
   });
 
-  // Build the context block to inject into the user message
+  const ctx = (session.context ?? {}) as Record<string, unknown>;
+  const history = (ctx.history ?? []) as Array<{ role: "user" | "assistant"; content: string }>;
+
+  // Build context block for the current turn
   const contextBlock = {
     chatId,
     senderId,
+    userName: ctx.userName ?? null,
     sessionState: session.state,
-    sessionContext: session.context ?? {},
+    sessionContext: { ...ctx, history: undefined, userName: undefined },
     projectId: session.projectId ?? null,
   };
 
@@ -58,34 +62,43 @@ ${message}
   let fullText = "";
 
   try {
-    // Stream with adaptive thinking for complex financial reasoning
-    const stream = client.messages.stream({
-      model: "claude-opus-4-6",
-      max_tokens: 4096,
-      thinking: { type: "adaptive" },
+    const response = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2048,
       system: PACTAI_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userContent }],
+      messages: [
+        ...history,
+        { role: "user", content: userContent },
+      ],
     });
 
-    for await (const event of stream) {
-      if (
-        event.type === "content_block_delta" &&
-        event.delta.type === "text_delta"
-      ) {
-        fullText += event.delta.text;
+    for (const block of response.content) {
+      if (block.type === "text") {
+        fullText += block.text;
       }
     }
-
-    await stream.finalMessage();
   } catch (err) {
     logger.error({ err, chatId }, "Agent API call failed");
     return {
-      reply:
-        "⚠️ System Error\n\nI encountered an error processing your request. Please try again.",
+      reply: "⚠️ Something went wrong. Please try again.",
       actions: [],
       requiresConfirmation: false,
     };
   }
+
+  // Persist conversation history (keep last 10 pairs = 20 messages)
+  const updatedHistory = [
+    ...history,
+    { role: "user" as const, content: userContent },
+    { role: "assistant" as const, content: fullText },
+  ].slice(-20);
+
+  await prisma.chatSession.update({
+    where: { chatId },
+    data: {
+      context: { ...ctx, history: updatedHistory } as object,
+    },
+  });
 
   // Parse the JSON response from Claude
   const output = parseAgentOutput(fullText);

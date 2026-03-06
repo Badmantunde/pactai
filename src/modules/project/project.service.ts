@@ -6,25 +6,37 @@ import { formatAmount, formatDate, DIVIDER } from "../../utils/formatters";
 
 export const CreateProjectSchema = z.object({
   name: z.string().min(1),
-  clientPhone: z.string().min(7),
+  clientPhone: z.string().min(7).transform((p) => p.replace(/\D/g, "")),
   freelancerName: z.string().min(1),
-  freelancerPhone: z.string().optional(),
-  totalAmount: z.number().int().positive(), // smallest currency unit
-  currency: z.string().default("NGN"),
-  paymentType: z.enum(["FULL", "MILESTONE"]),
+  freelancerPhone: z.string().optional().transform((p) => p?.replace(/\D/g, "")),
+  freelancerAccountNumber: z.string().optional(),
+  freelancerBank: z.string().optional(),
+  // Accept string or number, coerce to integer kobo/cents (multiply major unit × 100)
+  totalAmount: z.union([z.string(), z.number()])
+    .transform((v) => Math.round(Number(v) * 100))
+    .pipe(z.number().int().positive()),
+  currency: z.string().default("NGN").transform((c) => c.toUpperCase()),
+  paymentType: z.string().transform((v) => v.toUpperCase()).pipe(z.enum(["FULL", "MILESTONE"])),
   milestones: z
     .array(
       z.object({
         title: z.string(),
-        amount: z.number().int().positive(),
+        amount: z.union([z.string(), z.number()])
+          .transform((v) => Math.round(Number(v) * 100))
+          .pipe(z.number().int().positive()),
         dueDate: z.string().optional(),
         order: z.number().int(),
       })
     )
     .optional(),
-  deadline: z.string(), // ISO date string
-  escrowRequired: z.boolean().default(true),
-  actor: z.string(), // WhatsApp number of person creating
+  deadline: z.string().transform((d) => {
+    const parsed = new Date(d);
+    return isNaN(parsed.getTime()) ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() : parsed.toISOString();
+  }),
+  escrowRequired: z.union([z.boolean(), z.string()])
+    .transform((v) => v === true || v === "true" || v === "yes")
+    .default(true),
+  actor: z.string(),
   chatId: z.string(),
 });
 
@@ -39,6 +51,8 @@ export async function createProject(input: CreateProjectInput) {
       clientPhone: validated.clientPhone,
       freelancerName: validated.freelancerName,
       freelancerPhone: validated.freelancerPhone,
+      freelancerAccountNumber: validated.freelancerAccountNumber,
+      freelancerBank: validated.freelancerBank,
       totalAmount: validated.totalAmount,
       currency: validated.currency,
       paymentType: validated.paymentType as PaymentType,

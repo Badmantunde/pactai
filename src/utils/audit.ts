@@ -16,7 +16,7 @@ export async function logAudit(params: AuditParams): Promise<void> {
       actor: params.actor,
       projectId: params.projectId ?? null,
       chatId: params.chatId ?? null,
-      details: params.details ?? {},
+      details: (params.details ?? {}) as object,
     },
   });
 }

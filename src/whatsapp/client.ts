@@ -1,13 +1,16 @@
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import qrcode from "qrcode-terminal";
+import pino from "pino";
 import { logger } from "../utils/logger";
 
 export type WASocket = ReturnType<typeof makeWASocket>;
+
+const baileysLogger = pino({ level: "silent" });
 
 let sock: WASocket | null = null;
 
@@ -19,13 +22,23 @@ export async function initWhatsApp(
   onMessage: (chatId: string, senderId: string, text: string, isGroup: boolean) => Promise<void>
 ): Promise<WASocket> {
   const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
-  const { version } = await fetchLatestBaileysVersion();
+
+  let version: [number, number, number];
+  try {
+    const result = await fetchLatestWaWebVersion();
+    version = result.version;
+    logger.info({ version }, "Using WhatsApp Web version");
+  } catch {
+    version = [2, 3000, 1023230];
+    logger.warn("Could not fetch WA version, using fallback");
+  }
 
   sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
-    logger: logger.child({ module: "baileys" }) as never,
+    logger: baileysLogger as never,
+    browser: ["Pactai", "Chrome", "120.0.0"],
   });
 
   // Save credentials on update
@@ -97,4 +110,42 @@ export async function initWhatsApp(
 export async function sendMessage(to: string, text: string): Promise<void> {
   if (!sock) throw new Error("WhatsApp socket not initialized");
   await sock.sendMessage(to, { text });
+}
+
+/** Send a PDF document via WhatsApp. */
+export async function sendDocument(
+  to: string,
+  buffer: Buffer,
+  fileName: string
+): Promise<void> {
+  if (!sock) throw new Error("WhatsApp socket not initialized");
+  await sock.sendMessage(to, {
+    document: buffer,
+    mimetype: "application/pdf",
+    fileName,
+  });
+}
+
+/** Create a WhatsApp group and return { groupId, inviteLink }. */
+export async function createWhatsAppGroup(
+  subject: string,
+  participants: string[]
+): Promise<{ groupId: string; inviteLink: string }> {
+  if (!sock) throw new Error("WhatsApp socket not initialized");
+
+  const jids = participants.map((p) => {
+    const clean = p.replace(/\D/g, "");
+    return `${clean}@s.whatsapp.net`;
+  });
+
+  const result = await sock.groupCreate(subject, jids);
+  const groupId = result.id;
+
+  // Wait briefly for group to be ready before fetching invite code
+  await new Promise((r) => setTimeout(r, 2000));
+
+  const inviteCode = await sock.groupInviteCode(groupId);
+  if (!inviteCode) throw new Error(`Could not get invite code for group ${groupId}`);
+
+  return { groupId, inviteLink: `https://chat.whatsapp.com/${inviteCode}` };
 }

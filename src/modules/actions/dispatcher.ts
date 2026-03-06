@@ -2,6 +2,12 @@ import { AgentAction } from "../../agent";
 import { logger } from "../../utils/logger";
 import { createProject } from "../project/project.service";
 import { createInvoice, formatInvoicePreview } from "../invoice/invoice.service";
+import { generateInvoicePDF } from "../../utils/pdf";
+import {
+  sendMessage,
+  sendDocument,
+  createWhatsAppGroup,
+} from "../../whatsapp/client";
 import {
   fundEscrow,
   lockEscrow,
@@ -48,12 +54,99 @@ export async function dispatchAction(
           data: { projectId: project.id, state: "IDLE" },
         });
 
-        return `✅ Project created — ID: ${project.id}`;
+        // Auto-create WhatsApp group for the project
+        let groupInfo = "";
+        try {
+          const participants = [ctx.senderId];
+          if (project.clientPhone) participants.push(project.clientPhone);
+          if (project.freelancerPhone) participants.push(project.freelancerPhone);
+
+          logger.info({ participants }, "Creating WhatsApp group");
+          const { groupId, inviteLink } = await createWhatsAppGroup(
+            `Pactai: ${project.name}`,
+            [...new Set(participants)]
+          );
+          logger.info({ groupId, inviteLink }, "WhatsApp group created");
+
+          await prisma.project.update({
+            where: { id: project.id },
+            data: { groupChatId: groupId },
+          });
+
+          // Send group invite to client
+          if (project.clientPhone) {
+            const clientJid = `${project.clientPhone.replace(/\D/g, "")}@s.whatsapp.net`;
+            logger.info({ clientJid }, "Sending group invite to client");
+            await sendMessage(
+              clientJid,
+              `👋 Hi! You've been added to a project with Pactai.\n\n📋 *${project.name}*\n\nJoin the project group: ${inviteLink}`
+            );
+          }
+
+          groupInfo = `\n🔗 Group created — invite link sent to client.`;
+        } catch (err) {
+          logger.error({ err }, "Group creation failed");
+          groupInfo = `\n⚠️ Group creation failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+
+        // Generate and send PDF invoice
+        let invoiceInfo = "";
+        try {
+          const invoice = await createInvoice({
+            projectId: project.id,
+            dueDate: project.deadline.toISOString(),
+            actor: ctx.senderId,
+            chatId: ctx.chatId,
+          });
+
+          const fullProject = await prisma.project.findUniqueOrThrow({
+            where: { id: project.id },
+          });
+
+          logger.info({ invoiceCode: invoice.invoiceCode }, "Generating PDF invoice");
+          const pdfBuffer = await generateInvoicePDF({
+            invoiceCode: invoice.invoiceCode,
+            projectName: fullProject.name,
+            clientPhone: fullProject.clientPhone,
+            freelancerName: fullProject.freelancerName,
+            freelancerAccountNumber: fullProject.freelancerAccountNumber,
+            freelancerBank: fullProject.freelancerBank,
+            amount: fullProject.totalAmount,
+            currency: fullProject.currency,
+            dueDate: invoice.dueDate,
+            createdAt: invoice.createdAt,
+          });
+
+          logger.info({ chatId: ctx.chatId }, "Sending invoice PDF to creator");
+          await sendDocument(ctx.chatId, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`);
+
+          if (project.clientPhone) {
+            const clientJid = `${project.clientPhone.replace(/\D/g, "")}@s.whatsapp.net`;
+            logger.info({ clientJid }, "Sending invoice PDF to client");
+            await sendDocument(clientJid, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`);
+          }
+
+          invoiceInfo = `\n🧾 Invoice ${invoice.invoiceCode} sent as PDF.`;
+        } catch (err) {
+          logger.error({ err }, "Invoice generation/send failed");
+          invoiceInfo = `\n⚠️ Invoice failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+
+        return `✅ Project *${project.name}* created!${groupInfo}${invoiceInfo}`;
       }
 
       case "CREATE_INVOICE": {
+        // Fall back to session projectId if agent didn't include it
+        let projectId = payload.projectId as string | undefined;
+        if (!projectId) {
+          const sess = await prisma.chatSession.findUnique({ where: { chatId: ctx.chatId } });
+          projectId = sess?.projectId ?? undefined;
+        }
+        if (!projectId) return "⚠️ No active project. Create a project first.";
+
         const invoice = await createInvoice({
           ...payload,
+          projectId,
           actor: ctx.senderId,
           chatId: ctx.chatId,
         } as Parameters<typeof createInvoice>[0]);
@@ -143,7 +236,7 @@ export async function dispatchAction(
         };
         await prisma.chatSession.update({
           where: { chatId: ctx.chatId },
-          data: { state, context: context ?? {} },
+          data: { state, context: (context ?? {}) as object },
         });
         return null;
       }

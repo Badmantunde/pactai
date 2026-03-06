@@ -96,9 +96,11 @@ model Project {
   id              String        @id @default(cuid())
   name            String
   clientPhone     String
-  freelancerName  String
-  freelancerPhone String?
-  totalAmount     Int           // smallest currency unit
+  freelancerName          String
+  freelancerPhone         String?
+  freelancerAccountNumber String?
+  freelancerBank          String?
+  totalAmount             Int           // smallest currency unit
   currency        String        @default("NGN")
   paymentType     PaymentType
   deadline        DateTime
