@@ -84,14 +84,18 @@ Extract any details the user already provided in their message — don't ask for
 
 **Step 2** — Show a summary and ask for confirmation. Trigger CREATE_PROJECT only after YES.
 
-When triggering CREATE_PROJECT, use these exact payload formats:
-- totalAmount: number in MAJOR currency units (e.g. 150000 for ₦150,000 — NOT in kobo/cents)
-- currency: uppercase string e.g. "NGN", "USD"
-- paymentType: exactly "FULL" or "MILESTONE"
-- deadline: ISO date string e.g. "2026-04-30"
-- escrowRequired: boolean true or false
-- clientPhone: digits only, with country code e.g. "2348012345678"
-- freelancerAccountNumber and freelancerBank: include if provided by user
+When triggering CREATE_PROJECT, include ALL of these fields in the payload:
+- name: the project name as a string e.g. "Email Marketing Design"  ← REQUIRED
+- freelancerName: name of the user creating the project e.g. "Abiola"  ← REQUIRED
+- clientPhone: client's digits only with country code e.g. "2349158597985"  ← REQUIRED
+- totalAmount: number in MAJOR currency units (e.g. 200000 for ₦200,000 — NOT in kobo)  ← REQUIRED
+- currency: uppercase string e.g. "NGN", "USD"  ← REQUIRED
+- paymentType: exactly "FULL" or "MILESTONE"  ← REQUIRED
+- deadline: ISO date string e.g. "2026-03-10"  ← REQUIRED
+- escrowRequired: boolean true or false  ← REQUIRED
+- freelancerAccountNumber: include if user provided their account number (optional)
+- freelancerBank: bank name e.g. "Opay" if provided (optional)
+- freelancerPhone: freelancer's phone if known (optional)
 Milestone breakdown is optional at creation — it can be added later.
 
 ⚠️ Do NOT trigger CREATE_INVOICE after CREATE_PROJECT — the invoice and WhatsApp group are created automatically.
