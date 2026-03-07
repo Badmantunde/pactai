@@ -3,6 +3,7 @@ import { config } from "../config";
 import { PACTAI_SYSTEM_PROMPT } from "./system-prompt";
 import { logger } from "../utils/logger";
 import { prisma } from "../database";
+import { getWallet, getDefaultAccount } from "../modules/wallet/wallet.service";
 
 const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
 
@@ -41,6 +42,16 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
   const ctx = (session.context ?? {}) as Record<string, unknown>;
   const history = (ctx.history ?? []) as Array<{ role: "user" | "assistant"; content: string }>;
 
+  // Load wallet for context (phone digits only)
+  const senderPhone = senderId.replace(/\D/g, "");
+  const [walletAccounts, defaultAccount, escrowData] = await Promise.all([
+    getWallet(senderPhone),
+    getDefaultAccount(senderPhone),
+    session.projectId
+      ? prisma.escrow.findUnique({ where: { projectId: session.projectId } })
+      : Promise.resolve(null),
+  ]);
+
   // Build context block for the current turn
   const contextBlock = {
     chatId,
@@ -49,6 +60,24 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     sessionState: session.state,
     sessionContext: { ...ctx, history: undefined, userName: undefined },
     projectId: session.projectId ?? null,
+    escrow: escrowData
+      ? { status: escrowData.status, amount: escrowData.amount, amountReleased: escrowData.amountReleased }
+      : null,
+    wallet: {
+      accounts: walletAccounts.map((a) => ({
+        accountNumber: a.accountNumber,
+        bankName: a.bankName,
+        accountName: a.accountName,
+        isDefault: a.isDefault,
+      })),
+      defaultAccount: defaultAccount
+        ? {
+            accountNumber: defaultAccount.accountNumber,
+            bankName: defaultAccount.bankName,
+            accountName: defaultAccount.accountName,
+          }
+        : null,
+    },
   };
 
   const userContent = `[CONTEXT]

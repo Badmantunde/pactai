@@ -54,10 +54,16 @@ export async function handleMessage(
   if (session.state === "AWAITING_CONFIRMATION" && session.context) {
     const ctx = session.context as Record<string, unknown>;
 
+    // Preserve userName and history across confirmation resets
+    const preserved = {
+      userName: sessionCtx.userName,
+      history: sessionCtx.history,
+    };
+
     if (normalizedText === "YES") {
       await prisma.chatSession.update({
         where: { chatId },
-        data: { state: "IDLE", context: {} },
+        data: { state: "IDLE", context: preserved as object },
       });
 
       const pendingActions = ctx.pendingActions as Array<{
@@ -81,7 +87,7 @@ export async function handleMessage(
     if (normalizedText === "NO") {
       await prisma.chatSession.update({
         where: { chatId },
-        data: { state: "IDLE", context: {} },
+        data: { state: "IDLE", context: preserved as object },
       });
       await sendMessage(chatId, "❌ Action cancelled.");
       return;
@@ -104,13 +110,15 @@ export async function handleMessage(
     if (result) actionMessages.push(result);
   }
 
-  // If confirmation required, store pending actions in session
+  // If confirmation required, store pending actions — keep userName + history
   if (agentOutput.requiresConfirmation && agentOutput.actions.length > 0) {
     await prisma.chatSession.update({
       where: { chatId },
       data: {
         state: "AWAITING_CONFIRMATION",
         context: {
+          userName: sessionCtx.userName,
+          history: sessionCtx.history,
           pendingActions: agentOutput.actions,
           confirmationKey: agentOutput.confirmationKey,
         } as object,

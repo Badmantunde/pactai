@@ -66,6 +66,8 @@ enum PayrollStatus {
 }
 
 enum AuditAction {
+  WALLET_ACCOUNT_ADDED
+  WALLET_ACCOUNT_REMOVED
   PROJECT_CREATED
   PROJECT_FUNDED
   PROJECT_COMPLETED
@@ -95,6 +97,7 @@ enum AuditAction {
 model Project {
   id              String        @id @default(cuid())
   name            String
+  clientName              String?
   clientPhone     String
   freelancerName          String
   freelancerPhone         String?
@@ -104,6 +107,7 @@ model Project {
   currency        String        @default("NGN")
   paymentType     PaymentType
   deadline        DateTime
+  toolsRequired           String[]      // tools/deliverables for the project
   escrowRequired  Boolean       @default(true)
   status          ProjectStatus @default(DRAFT)
   groupChatId     String?       // WhatsApp group chat ID
@@ -250,6 +254,22 @@ model AuditLog {
   @@index([projectId])
   @@index([actor])
   @@index([createdAt])
+}
+
+// Stores bank accounts linked to a user's WhatsApp number
+model WalletAccount {
+  id            String   @id @default(cuid())
+  phone         String   // owner's WhatsApp number (digits only)
+  accountNumber String
+  bankName      String
+  accountName   String?
+  isDefault     Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([phone, accountNumber])
+  @@index([phone])
 }
 
 // Stores per-chat conversation context for the Claude agent

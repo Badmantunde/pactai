@@ -22,7 +22,15 @@ import {
   createPayrollBatch,
   formatPayrollSummary,
 } from "../payroll/payroll.service";
+import {
+  addWalletAccount,
+  removeWalletAccount,
+  setDefaultAccount,
+  getWallet,
+  formatWallet,
+} from "../wallet/wallet.service";
 import { prisma } from "../../database";
+import { formatAmount, formatDate, DIVIDER } from "../../utils/formatters";
 
 export interface DispatchContext {
   chatId: string;
@@ -55,46 +63,91 @@ export async function dispatchAction(
           data: { projectId: project.id, state: "IDLE" },
         });
 
-        // Fire off group creation + invoice PDF in the background so the
-        // user gets an instant reply — heavy Baileys uploads don't block.
+        // Run group creation and PDF invoice in parallel — both fire-and-forget.
         const projectSnapshot = { ...project };
         const { chatId: originChatId, senderId } = ctx;
+        const clientJid = projectSnapshot.clientPhone
+          ? `${projectSnapshot.clientPhone}@s.whatsapp.net`
+          : null;
 
+        // ── Group creation (independent, fast path) ───────────────────────────
         void (async () => {
-          // ── WhatsApp group ──────────────────────────────────────────────
           try {
-            // Only add the client — the bot (session owner) is creator by default.
-            // Adding the freelancer's own number causes "participant already in group".
-            const participants: string[] = [];
-            if (projectSnapshot.clientPhone) participants.push(projectSnapshot.clientPhone);
-            if (
-              projectSnapshot.freelancerPhone &&
-              projectSnapshot.freelancerPhone !== senderId.replace(/\D/g, "")
-            ) {
-              participants.push(projectSnapshot.freelancerPhone);
-            }
+            const phones = [...new Set([
+              senderId.replace(/\D/g, ""),
+              projectSnapshot.clientPhone,
+              projectSnapshot.freelancerPhone,
+            ].filter(Boolean) as string[])];
 
-            logger.info({ participants }, "BG: Creating WhatsApp group");
             const { groupId, inviteLink } = await createWhatsAppGroup(
               `Pactai: ${projectSnapshot.name}`,
-              [...new Set(participants)]
+              phones
             );
-            logger.info({ groupId, inviteLink }, "BG: WhatsApp group created");
 
-            await prisma.project.update({
-              where: { id: projectSnapshot.id },
-              data: { groupChatId: groupId },
-            });
+            // Save group ID to project and create a session for the group
+            // so the AI has full project memory when group messages come in
+            await Promise.all([
+              prisma.project.update({
+                where: { id: projectSnapshot.id },
+                data: { groupChatId: groupId },
+              }),
+              prisma.chatSession.upsert({
+                where: { chatId: groupId },
+                create: { chatId: groupId, state: "IDLE", projectId: projectSnapshot.id },
+                update: { projectId: projectSnapshot.id },
+              }),
+            ]);
 
-            if (projectSnapshot.clientPhone) {
-              const clientJid = `${projectSnapshot.clientPhone}@s.whatsapp.net`;
-              await sendMessage(
-                clientJid,
-                `👋 Hi! You've been added to a project on Pactai.\n\n📋 *${projectSnapshot.name}*\n\nJoin the project group: ${inviteLink}`
-              );
-            }
+            const linkMsg =
+              `🔗 *Your project group is ready!*\n\n` +
+              `📋 *${projectSnapshot.name}*\n` +
+              `👤 Freelancer: ${projectSnapshot.freelancerName}\n` +
+              `👤 Client: ${projectSnapshot.clientName ?? `+${projectSnapshot.clientPhone}`}\n\n` +
+              `Tap to join: ${inviteLink}`;
 
-            await sendMessage(originChatId, `🔗 Project group created successfully.`);
+            // Send invite link to BOTH parties in parallel.
+            // Use originChatId for the freelancer (their private bot chat).
+            await Promise.all([
+              sendMessage(originChatId, linkMsg),
+              clientJid
+                ? sendMessage(
+                    clientJid,
+                    `👋 Hi${projectSnapshot.clientName ? ` ${projectSnapshot.clientName}` : ""}! ` +
+                    `You've been invited to a Pactai project.\n\n${linkMsg}`
+                  )
+                : Promise.resolve(),
+            ]);
+
+            // Post a full project brief inside the group so the AI acts as moderator
+            const tools = projectSnapshot.toolsRequired?.length
+              ? `\n\n🛠️ *Tools & Deliverables:*\n${projectSnapshot.toolsRequired.map((t) => `  • ${t}`).join("\n")}`
+              : "";
+
+            const escrowNote = projectSnapshot.escrowRequired
+              ? `\n\n⚠️ *Escrow Required* — Client must fund escrow before work begins. Reply *FUND ESCROW* to proceed.`
+              : "";
+
+            const groupBrief =
+              `🤖 *Pactai — AI Project Moderator*\n` +
+              `${DIVIDER}\n` +
+              `📋 *${projectSnapshot.name}*\n` +
+              `👤 Freelancer: ${projectSnapshot.freelancerName}\n` +
+              `👤 Client: ${projectSnapshot.clientName ?? `+${projectSnapshot.clientPhone}`}\n` +
+              `💰 Amount: ${formatAmount(projectSnapshot.totalAmount, projectSnapshot.currency)}\n` +
+              `📅 Deadline: ${formatDate(projectSnapshot.deadline)}\n` +
+              `💳 Payment: ${projectSnapshot.paymentType}` +
+              tools +
+              escrowNote +
+              `\n${DIVIDER}\n` +
+              `I'll moderate this project from start to payment.\n\n` +
+              `*Freelancer* — when ready to begin, type:\n  📌 *START PROJECT*\n\n` +
+              `*Client* — once work is delivered, type:\n  ✅ *APPROVE* to release payment\n  🔄 *REQUEST REVISION* to ask for changes`;
+
+            // Let the group settle before posting
+            await new Promise((r) => setTimeout(r, 2000));
+            await sendMessage(groupId, groupBrief);
+
+            logger.info({ groupId }, "BG: Group created, brief posted, links sent");
           } catch (err) {
             logger.error({ err }, "BG: Group creation failed");
             await sendMessage(
@@ -102,8 +155,10 @@ export async function dispatchAction(
               `⚠️ Group creation failed: ${err instanceof Error ? err.message : String(err)}`
             );
           }
+        })();
 
-          // ── PDF invoice ─────────────────────────────────────────────────
+        // ── PDF invoice (independent, runs in parallel with group creation) ────
+        void (async () => {
           try {
             const invoice = await createInvoice({
               projectId: projectSnapshot.id,
@@ -112,10 +167,10 @@ export async function dispatchAction(
               chatId: originChatId,
             });
 
-            logger.info({ invoiceCode: invoice.invoiceCode }, "BG: Generating PDF invoice");
             const pdfBuffer = await generateInvoicePDF({
               invoiceCode: invoice.invoiceCode,
               projectName: projectSnapshot.name,
+              clientName: projectSnapshot.clientName,
               clientPhone: projectSnapshot.clientPhone,
               freelancerName: projectSnapshot.freelancerName,
               freelancerAccountNumber: projectSnapshot.freelancerAccountNumber,
@@ -124,18 +179,20 @@ export async function dispatchAction(
               currency: projectSnapshot.currency,
               dueDate: invoice.dueDate,
               createdAt: invoice.createdAt,
+              toolsRequired: projectSnapshot.toolsRequired,
             });
 
-            await sendDocument(originChatId, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`);
-
-            if (projectSnapshot.clientPhone) {
-              const clientJid = `${projectSnapshot.clientPhone}@s.whatsapp.net`;
-              await sendDocument(clientJid, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`);
-            }
+            // Send PDF to both parties in parallel
+            await Promise.all([
+              sendDocument(originChatId, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`),
+              clientJid
+                ? sendDocument(clientJid, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`)
+                : Promise.resolve(),
+            ]);
 
             logger.info({ invoiceCode: invoice.invoiceCode }, "BG: Invoice PDF sent");
           } catch (err) {
-            logger.error({ err }, "BG: Invoice generation/send failed");
+            logger.error({ err }, "BG: Invoice PDF failed");
             await sendMessage(
               originChatId,
               `⚠️ Invoice PDF failed: ${err instanceof Error ? err.message : String(err)}`
@@ -143,11 +200,10 @@ export async function dispatchAction(
           }
         })();
 
-        return `✅ Project *${project.name}* created!\n⏳ Sending invoice PDF and creating group chat in the background...`;
+        return `✅ Project *${project.name}* created!\n⏳ Creating group chat and sending invoice PDF in the background...`;
       }
 
       case "CREATE_INVOICE": {
-        // Fall back to session projectId if agent didn't include it
         let projectId = payload.projectId as string | undefined;
         if (!projectId) {
           const sess = await prisma.chatSession.findUnique({ where: { chatId: ctx.chatId } });
@@ -166,13 +222,12 @@ export async function dispatchAction(
           where: { id: invoice.projectId },
         });
 
-        // Generate and send PDF to creator and client
         let pdfInfo = "";
         try {
-          logger.info({ invoiceCode: invoice.invoiceCode }, "Generating PDF invoice");
           const pdfBuffer = await generateInvoicePDF({
             invoiceCode: invoice.invoiceCode,
             projectName: project.name,
+            clientName: project.clientName,
             clientPhone: project.clientPhone,
             freelancerName: project.freelancerName,
             freelancerAccountNumber: project.freelancerAccountNumber,
@@ -181,12 +236,13 @@ export async function dispatchAction(
             currency: invoice.currency,
             dueDate: invoice.dueDate,
             createdAt: invoice.createdAt,
+            toolsRequired: project.toolsRequired,
           });
 
           await sendDocument(ctx.chatId, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`);
 
           if (project.clientPhone) {
-            const clientJid = `${project.clientPhone.replace(/\D/g, "")}@s.whatsapp.net`;
+            const clientJid = `${project.clientPhone}@s.whatsapp.net`;
             await sendDocument(clientJid, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`);
           }
 
@@ -204,10 +260,91 @@ export async function dispatchAction(
         ) + pdfInfo;
       }
 
+      // ── Wallet actions ────────────────────────────────────────────────────────
+      case "ADD_WALLET_ACCOUNT": {
+        const { accountNumber, bankName, accountName, setDefault } = payload as {
+          accountNumber: string;
+          bankName: string;
+          accountName?: string;
+          setDefault?: boolean;
+        };
+        const phone = ctx.senderId.replace(/\D/g, "");
+        const account = await addWalletAccount(
+          phone,
+          accountNumber,
+          bankName,
+          accountName,
+          setDefault ?? false,
+          ctx.chatId
+        );
+        return (
+          `✅ Account saved to your wallet!\n` +
+          DIVIDER + "\n" +
+          `Bank: ${account.bankName}\n` +
+          `Account: ${account.accountNumber}` +
+          (account.accountName ? `\nName: ${account.accountName}` : "") +
+          (account.isDefault ? "\n✅ Set as default" : "")
+        );
+      }
+
+      case "REMOVE_WALLET_ACCOUNT": {
+        const { accountNumber } = payload as { accountNumber: string };
+        const phone = ctx.senderId.replace(/\D/g, "");
+        await removeWalletAccount(phone, accountNumber, ctx.chatId);
+        return `🗑️ Account ${accountNumber} removed from your wallet.`;
+      }
+
+      case "SET_DEFAULT_ACCOUNT": {
+        const { accountNumber } = payload as { accountNumber: string };
+        const phone = ctx.senderId.replace(/\D/g, "");
+        await setDefaultAccount(phone, accountNumber);
+        return `✅ Account ${accountNumber} is now your default payout account.`;
+      }
+
+      case "VIEW_WALLET": {
+        const phone = ctx.senderId.replace(/\D/g, "");
+        const accounts = await getWallet(phone);
+        return formatWallet(accounts);
+      }
+
+      case "VIEW_BALANCE": {
+        const phone = ctx.senderId.replace(/\D/g, "");
+        const projects = await prisma.project.findMany({
+          where: {
+            OR: [
+              { clientPhone: phone },
+              { freelancerPhone: phone },
+            ],
+            status: { in: ["ACTIVE", "FUNDED", "IN_PROGRESS", "PENDING_APPROVAL"] },
+          },
+          include: { escrow: true },
+        });
+
+        if (projects.length === 0) {
+          return "💰 No active projects with escrow found.";
+        }
+
+        const lines = ["💰 ESCROW BALANCES", DIVIDER];
+        for (const p of projects) {
+          if (p.escrow) {
+            const locked = p.escrow.amount - p.escrow.amountReleased;
+            lines.push(
+              `📋 *${p.name}*\n` +
+              `   Total: ${formatAmount(p.escrow.amount, p.escrow.currency)}\n` +
+              `   Released: ${formatAmount(p.escrow.amountReleased, p.escrow.currency)}\n` +
+              `   Locked: ${formatAmount(locked, p.escrow.currency)}\n` +
+              `   Status: ${p.escrow.status}`
+            );
+          }
+        }
+        lines.push(DIVIDER);
+        return lines.join("\n");
+      }
+
       case "FUND_ESCROW": {
         const projectId = payload.projectId as string;
         const escrow = await fundEscrow(projectId, ctx.senderId, ctx.chatId);
-        return `🔒 Escrow funded — ${escrow.amount} ${escrow.currency} locked.`;
+        return `🔒 Escrow funded — ${formatAmount(escrow.amount, escrow.currency)} locked.`;
       }
 
       case "LOCK_ESCROW": {
@@ -227,17 +364,13 @@ export async function dispatchAction(
           ctx.senderId,
           ctx.chatId
         );
-        return `💰 Milestone escrow released — ${escrow.amountReleased} of ${escrow.amount} ${escrow.currency} paid out.`;
+        return `💰 Milestone escrow released — ${formatAmount(escrow.amountReleased, escrow.currency)} of ${formatAmount(escrow.amount, escrow.currency)} paid out.`;
       }
 
       case "RELEASE_ESCROW_FULL": {
         const projectId = payload.projectId as string;
-        const escrow = await releaseFullEscrow(
-          projectId,
-          ctx.senderId,
-          ctx.chatId
-        );
-        return `💰 Full escrow released — ${escrow.amount} ${escrow.currency} paid out. Project marked COMPLETED.`;
+        const escrow = await releaseFullEscrow(projectId, ctx.senderId, ctx.chatId);
+        return `💰 Full escrow released — ${formatAmount(escrow.amount, escrow.currency)} paid out. Project marked COMPLETED.`;
       }
 
       case "OPEN_DISPUTE": {
@@ -259,10 +392,7 @@ export async function dispatchAction(
       }
 
       case "UPDATE_PROJECT_STATUS": {
-        const { projectId, status } = payload as {
-          projectId: string;
-          status: string;
-        };
+        const { projectId, status } = payload as { projectId: string; status: string };
         await prisma.project.update({
           where: { id: projectId },
           data: { status: status as never },
@@ -275,9 +405,22 @@ export async function dispatchAction(
           state: string;
           context?: Record<string, unknown>;
         };
+        // Always read current context first so userName + history are never wiped
+        const current = await prisma.chatSession.findUnique({
+          where: { chatId: ctx.chatId },
+          select: { context: true },
+        });
+        const currentCtx = (current?.context ?? {}) as Record<string, unknown>;
         await prisma.chatSession.update({
           where: { chatId: ctx.chatId },
-          data: { state, context: (context ?? {}) as object },
+          data: {
+            state,
+            context: {
+              ...context,
+              userName: currentCtx.userName,
+              history: currentCtx.history,
+            } as object,
+          },
         });
         return null;
       }

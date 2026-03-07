@@ -6,16 +6,29 @@ import { formatAmount, formatDate, DIVIDER } from "../../utils/formatters";
 
 export const CreateProjectSchema = z.object({
   name: z.string().min(1),
+  clientName: z.string().optional(),
   clientPhone: z.string().min(7).transform((p) => p.replace(/\D/g, "")),
   freelancerName: z.string().min(1),
   freelancerPhone: z.string().optional().transform((p) => p?.replace(/\D/g, "")),
   freelancerAccountNumber: z.string().optional(),
   freelancerBank: z.string().optional(),
+  toolsRequired: z.array(z.string()).optional().default([]),
   // Accept string or number, coerce to integer kobo/cents (multiply major unit × 100)
   totalAmount: z.union([z.string(), z.number()])
     .transform((v) => Math.round(Number(v) * 100))
     .pipe(z.number().int().positive()),
-  currency: z.string().default("NGN").transform((c) => c.toUpperCase()),
+  currency: z.string().default("NGN").transform((c) => {
+    const upper = c.trim().toUpperCase();
+    const aliases: Record<string, string> = {
+      NAIRA: "NGN", DOLLAR: "USD", DOLLARS: "USD",
+      POUND: "GBP", POUNDS: "GBP", STERLING: "GBP",
+      EURO: "EUR",  EUROS: "EUR",
+      CEDI: "GHS",  CEDIS: "GHS",
+      SHILLING: "KES", SHILLINGS: "KES",
+      RAND: "ZAR",
+    };
+    return aliases[upper] ?? upper;
+  }),
   paymentType: z.string().transform((v) => v.toUpperCase()).pipe(z.enum(["FULL", "MILESTONE"])),
   milestones: z
     .array(
@@ -48,11 +61,13 @@ export async function createProject(input: CreateProjectInput) {
   const project = await prisma.project.create({
     data: {
       name: validated.name,
+      clientName: validated.clientName,
       clientPhone: validated.clientPhone,
       freelancerName: validated.freelancerName,
       freelancerPhone: validated.freelancerPhone,
       freelancerAccountNumber: validated.freelancerAccountNumber,
       freelancerBank: validated.freelancerBank,
+      toolsRequired: validated.toolsRequired,
       totalAmount: validated.totalAmount,
       currency: validated.currency,
       paymentType: validated.paymentType as PaymentType,
