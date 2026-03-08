@@ -44,7 +44,7 @@ h1{color:#16a34a;font-size:2rem;margin:0 0 8px}p{color:#555;margin:8px 0}
 </div></body></html>`);
 
     // Process async — do not block the redirect response
-    if (status === "successful" && tx_ref?.startsWith("escrow_")) {
+    if ((status === "successful" || status === "completed") && tx_ref?.startsWith("escrow_")) {
       handleEscrowPayment(tx_ref).catch((err) => {
         logger.error({ err, tx_ref }, "Payment redirect handler error");
       });
