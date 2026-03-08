@@ -168,38 +168,20 @@ export async function createWhatsAppGroup(
 ): Promise<{ groupId: string; inviteLink: string }> {
   if (!sock) throw new Error("WhatsApp socket not initialized");
 
-  const activeSock = sock;
-
-  const checks = await Promise.all(
+  // Build JIDs directly — skipping onWhatsApp() pre-check which is slow in cloud.
+  // Baileys silently drops numbers that aren't on WhatsApp during groupCreate.
+  const jids = [...new Set(
     participants
       .map((p) => p.replace(/\D/g, ""))
       .filter((p) => p.length > 6)
-      .map(async (clean) => {
-        try {
-          const results = await activeSock.onWhatsApp(clean);
-          const found = results?.[0];
+      .map((p) => `${p}@s.whatsapp.net`)
+  )];
 
-          if (found?.exists) return found.jid;
-
-          logger.warn({ phone: clean }, "Phone not on WhatsApp — skipping");
-          return null;
-        } catch (err) {
-          logger.warn(
-            { phone: clean, err },
-            "onWhatsApp check failed — skipping"
-          );
-          return null;
-        }
-      })
-  );
-
-  const validJids = checks.filter((jid): jid is string => jid !== null);
-
-  if (validJids.length === 0) {
-    throw new Error("No valid WhatsApp numbers found among participants.");
+  if (jids.length === 0) {
+    throw new Error("No valid phone numbers provided for group.");
   }
 
-  const result = await sock.groupCreate(subject, validJids);
+  const result = await sock.groupCreate(subject, jids);
 
   if (!result?.id) {
     throw new Error("groupCreate returned no group ID");
@@ -207,7 +189,8 @@ export async function createWhatsAppGroup(
 
   const groupId = result.id;
 
-  await new Promise((r) => setTimeout(r, 2000));
+  // Brief pause so group is fully provisioned before fetching invite code
+  await new Promise((r) => setTimeout(r, 1500));
 
   const inviteCode = await sock.groupInviteCode(groupId);
 

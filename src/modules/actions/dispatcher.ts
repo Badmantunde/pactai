@@ -74,9 +74,15 @@ export async function dispatchAction(
           ? `${projectSnapshot.clientPhone}@s.whatsapp.net`
           : null;
 
-        // ── Group creation (independent, fast path) ───────────────────────────
-        void (async () => {
-          try {
+        // Helper: reject after ms so background tasks don't hang forever
+        const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
+          Promise.race([p, new Promise<T>((_, reject) =>
+            setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
+          )]);
+
+        // ── Group creation ─────────────────────────────────────────────────────
+        void withTimeout(
+          (async () => {
             const phones = [...new Set([
               senderId.replace(/\D/g, ""),
               projectSnapshot.clientPhone,
@@ -88,8 +94,6 @@ export async function dispatchAction(
               phones
             );
 
-            // Save group ID to project and create a session for the group
-            // so the AI has full project memory when group messages come in
             await Promise.all([
               prisma.project.update({
                 where: { id: projectSnapshot.id },
@@ -109,8 +113,6 @@ export async function dispatchAction(
               `👤 Client: ${projectSnapshot.clientName ?? `+${projectSnapshot.clientPhone}`}\n\n` +
               `Tap to join: ${inviteLink}`;
 
-            // Send invite link to BOTH parties in parallel.
-            // Use originChatId for the freelancer (their private bot chat).
             await Promise.all([
               sendMessage(originChatId, linkMsg),
               clientJid
@@ -122,7 +124,6 @@ export async function dispatchAction(
                 : Promise.resolve(),
             ]);
 
-            // Post a full project brief inside the group so the AI acts as moderator
             const tools = projectSnapshot.toolsRequired?.length
               ? `\n\n🛠️ *Tools & Deliverables:*\n${projectSnapshot.toolsRequired.map((t) => `  • ${t}`).join("\n")}`
               : "";
@@ -147,23 +148,23 @@ export async function dispatchAction(
               `*Freelancer* — when ready to begin, type:\n  📌 *START PROJECT*\n\n` +
               `*Client* — once work is delivered, type:\n  ✅ *APPROVE* to release payment\n  🔄 *REQUEST REVISION* to ask for changes`;
 
-            // Let the group settle before posting
-            await new Promise((r) => setTimeout(r, 2000));
+            await new Promise((r) => setTimeout(r, 1500));
             await sendMessage(groupId, groupBrief);
 
             logger.info({ groupId }, "BG: Group created, brief posted, links sent");
-          } catch (err) {
-            logger.error({ err }, "BG: Group creation failed");
-            await sendMessage(
-              originChatId,
-              `⚠️ Group creation failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-        })();
+          })(),
+          60_000,
+          "Group creation"
+        ).catch(async (err) => {
+          logger.error({ err }, "BG: Group creation failed");
+          await sendMessage(originChatId,
+            `⚠️ Group creation failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        });
 
-        // ── PDF invoice (independent, runs in parallel with group creation) ────
-        void (async () => {
-          try {
+        // ── PDF invoice ────────────────────────────────────────────────────────
+        void withTimeout(
+          (async () => {
             const invoice = await createInvoice({
               projectId: projectSnapshot.id,
               dueDate: projectSnapshot.deadline.toISOString(),
@@ -186,7 +187,6 @@ export async function dispatchAction(
               toolsRequired: projectSnapshot.toolsRequired,
             });
 
-            // Send PDF to both parties in parallel
             await Promise.all([
               sendDocument(originChatId, pdfBuffer, `Invoice-${invoice.invoiceCode}.pdf`),
               clientJid
@@ -195,14 +195,15 @@ export async function dispatchAction(
             ]);
 
             logger.info({ invoiceCode: invoice.invoiceCode }, "BG: Invoice PDF sent");
-          } catch (err) {
-            logger.error({ err }, "BG: Invoice PDF failed");
-            await sendMessage(
-              originChatId,
-              `⚠️ Invoice PDF failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-        })();
+          })(),
+          60_000,
+          "Invoice PDF"
+        ).catch(async (err) => {
+          logger.error({ err }, "BG: Invoice PDF failed");
+          await sendMessage(originChatId,
+            `⚠️ Invoice PDF failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        });
 
         return `✅ Project *${project.name}* created!\n⏳ Creating group chat and sending invoice PDF in the background...`;
       }
