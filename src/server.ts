@@ -11,7 +11,7 @@ import { prisma } from "./database";
 import { verifyWebhookSignature, verifyTransaction } from "./modules/payment/flutterwave.service";
 import { fundEscrow } from "./modules/escrow/escrow.service";
 import { sendMessage } from "./whatsapp/client";
-import { formatAmount } from "./utils/formatters";
+import { formatAmount, formatDate, DIVIDER } from "./utils/formatters";
 
 export function createServer() {
   const app = express();
@@ -123,21 +123,43 @@ async function handleFlwEvent(
     });
 
     const amount = formatAmount(project.totalAmount, project.currency);
-    const successMsg =
-      `✅ *Escrow Funded!*\n\n` +
-      `💰 ${amount} has been received and locked in escrow for *${project.name}*.\n\n` +
-      `The freelancer can now begin work.\n` +
-      `Type *START PROJECT* to kick things off.`;
 
-    // Notify in group chat (if exists) or fallback to client phone
-    const notifyChat = project.groupChatId
-      ? project.groupChatId
-      : project.clientPhone
-        ? `${project.clientPhone}@s.whatsapp.net`
-        : null;
+    const groupAnnouncement =
+      `🔒 *Escrow Funded — Project Cleared to Start!*\n` +
+      DIVIDER + "\n" +
+      `📋 *${project.name}*\n` +
+      `👤 Freelancer: ${project.freelancerName}\n` +
+      `👤 Client: ${project.clientName ?? `+${project.clientPhone}`}\n` +
+      `💰 Locked in Escrow: ${amount}\n` +
+      `📅 Deadline: ${formatDate(project.deadline)}\n` +
+      DIVIDER + "\n\n" +
+      `✅ Payment has been received and is securely locked.\n` +
+      `It will be released automatically once the client approves the deliverables.\n\n` +
+      `📌 *${project.freelancerName}* — you're good to go!\n` +
+      `Type *START PROJECT* to officially commence work and log the start date.`;
 
-    if (notifyChat) {
-      await sendMessage(notifyChat, successMsg);
+    // Send to group if it exists
+    if (project.groupChatId) {
+      await sendMessage(project.groupChatId, groupAnnouncement);
+    }
+
+    // Also send a direct nudge to the freelancer's private chat
+    if (project.freelancerPhone) {
+      const freelancerJid = `${project.freelancerPhone}@s.whatsapp.net`;
+      await sendMessage(
+        freelancerJid,
+        `🔔 *Escrow funded for "${project.name}"!*\n\n` +
+        `${amount} is now locked and waiting for you.\n` +
+        `Head to the project group and type *START PROJECT* to begin.`
+      );
+    }
+
+    // Fallback: if no group yet, notify client directly
+    if (!project.groupChatId && project.clientPhone) {
+      await sendMessage(
+        `${project.clientPhone}@s.whatsapp.net`,
+        groupAnnouncement
+      );
     }
 
     logger.info({ projectId, txRef }, "Escrow funded via Flutterwave webhook");

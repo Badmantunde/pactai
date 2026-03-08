@@ -61,10 +61,18 @@ export async function dispatchAction(
           chatId: ctx.chatId,
         } as Parameters<typeof createProject>[0]);
 
-        // Link this project to the chat session
+        // Set new project as active without wiping session context for other projects
+        const existingSession = await prisma.chatSession.findUnique({
+          where: { chatId: ctx.chatId },
+        });
+        const existingCtx = (existingSession?.context ?? {}) as Record<string, unknown>;
         await prisma.chatSession.update({
           where: { chatId: ctx.chatId },
-          data: { projectId: project.id, state: "IDLE" },
+          data: {
+            projectId: project.id,
+            state: "IDLE",
+            context: { ...existingCtx } as object,
+          },
         });
 
         // Run group creation and PDF invoice in parallel — both fire-and-forget.
@@ -310,6 +318,89 @@ export async function dispatchAction(
         const phone = ctx.senderId.replace(/\D/g, "");
         const accounts = await getWallet(phone);
         return formatWallet(accounts);
+      }
+
+      case "LIST_PROJECTS": {
+        const phone = ctx.senderId.replace(/\D/g, "");
+        const allProjects = await prisma.project.findMany({
+          where: {
+            OR: [{ freelancerPhone: phone }, { clientPhone: phone }],
+          },
+          include: { escrow: true },
+          orderBy: { createdAt: "desc" },
+        });
+
+        if (allProjects.length === 0) {
+          return "📋 You have no projects yet. Type *start project* to create one.";
+        }
+
+        const statusIcon: Record<string, string> = {
+          DRAFT: "📝", ACTIVE: "🟡", FUNDED: "🔒", IN_PROGRESS: "⚙️",
+          PENDING_APPROVAL: "⏳", COMPLETED: "✅", DISPUTE: "⚖️", CANCELLED: "❌",
+        };
+
+        const activeId = (await prisma.chatSession.findUnique({
+          where: { chatId: ctx.chatId },
+        }))?.projectId;
+
+        const lines = [`📋 *Your Projects (${allProjects.length})*`, DIVIDER];
+        allProjects.forEach((p, i) => {
+          const icon = statusIcon[p.status] ?? "📋";
+          const active = p.id === activeId ? " ← *active*" : "";
+          lines.push(
+            `${i + 1}. ${icon} *${p.name}*${active}\n` +
+            `   Status: ${p.status}\n` +
+            `   Amount: ${formatAmount(p.totalAmount, p.currency)}\n` +
+            `   Client: ${p.clientName ?? `+${p.clientPhone}`}\n` +
+            `   ID: \`${p.id}\``
+          );
+        });
+        lines.push(DIVIDER);
+        lines.push(`To switch active project, type:\n*switch project <ID>*`);
+        return lines.join("\n");
+      }
+
+      case "SWITCH_PROJECT": {
+        const { projectId: switchProjectId } = payload as { projectId: string };
+        if (!switchProjectId) return "⚠️ Please provide a project ID.";
+
+        const phone = ctx.senderId.replace(/\D/g, "");
+        const target = await prisma.project.findFirst({
+          where: {
+            id: switchProjectId,
+            OR: [{ freelancerPhone: phone }, { clientPhone: phone }],
+          },
+          include: { escrow: true },
+        });
+
+        if (!target) return "⚠️ Project not found or you don't have access to it.";
+
+        const existingSess = await prisma.chatSession.findUnique({
+          where: { chatId: ctx.chatId },
+        });
+        const existingSessCtx = (existingSess?.context ?? {}) as Record<string, unknown>;
+
+        await prisma.chatSession.update({
+          where: { chatId: ctx.chatId },
+          data: {
+            projectId: target.id,
+            context: { ...existingSessCtx } as object,
+          },
+        });
+
+        const escrowLine = target.escrow
+          ? `\n🔒 Escrow: ${target.escrow.status} (${formatAmount(target.escrow.amount, target.currency)})`
+          : "";
+
+        return (
+          `✅ *Switched to project: ${target.name}*\n` +
+          DIVIDER + "\n" +
+          `Status: ${target.status}\n` +
+          `Client: ${target.clientName ?? `+${target.clientPhone}`}\n` +
+          `Amount: ${formatAmount(target.totalAmount, target.currency)}` +
+          escrowLine + "\n\n" +
+          `All commands now apply to this project.`
+        );
       }
 
       case "VIEW_BALANCE": {
