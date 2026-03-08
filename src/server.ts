@@ -177,8 +177,8 @@ export async function startServer() {
   const port = config.PORT;
 
   await new Promise<void>((resolve) => {
-    app.listen(port, () => {
-      logger.info({ port }, "HTTP server listening");
+    app.listen(port, "0.0.0.0", () => {
+      logger.info({ port }, "HTTP server listening on 0.0.0.0");
       resolve();
     });
   });

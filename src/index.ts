@@ -8,15 +8,17 @@ import { startServer } from "./server";
 async function main() {
   logger.info("Starting Pactai...");
 
-  // Verify database connection
+  // Start HTTP server FIRST so Railway health check passes immediately
+  await startServer();
+
+  // Then connect to database
   await prisma.$connect();
   logger.info("Database connected");
 
-  // Start HTTP server (health check + Flutterwave webhooks)
-  await startServer();
-
-  // Start WhatsApp
-  await initWhatsApp(handleMessage);
+  // Start WhatsApp (fire-and-forget so it doesn't block if QR scan is needed)
+  initWhatsApp(handleMessage).catch((err) => {
+    logger.error(err, "WhatsApp init failed");
+  });
 
   // Graceful shutdown
   process.on("SIGINT", async () => {
