@@ -9,6 +9,7 @@ import {
   createWhatsAppGroup,
 } from "../../whatsapp/client";
 import {
+  initiateEscrowFunding,
   fundEscrow,
   lockEscrow,
   releaseMilestoneEscrow,
@@ -20,6 +21,9 @@ import {
 } from "../dispute/dispute.service";
 import {
   createPayrollBatch,
+  confirmPayrollBatch,
+  processPayrollBatch,
+  getPayrollStatus,
   formatPayrollSummary,
 } from "../payroll/payroll.service";
 import {
@@ -343,6 +347,25 @@ export async function dispatchAction(
 
       case "FUND_ESCROW": {
         const projectId = payload.projectId as string;
+        // Generate a Flutterwave payment link; actual funding happens via webhook
+        const { link, amount, currency } = await initiateEscrowFunding(
+          projectId,
+          ctx.senderId,
+          ctx.chatId
+        );
+        return (
+          `💳 *Pay to Fund Escrow*\n` +
+          DIVIDER + "\n" +
+          `Amount: ${formatAmount(amount, currency)}\n\n` +
+          `Click the link below to pay securely via Flutterwave:\n` +
+          `👉 ${link}\n\n` +
+          `Once payment is confirmed, escrow will be locked automatically and work can begin.`
+        );
+      }
+
+      case "FUND_ESCROW_CONFIRMED": {
+        // Called internally when webhook confirms payment (not by the agent)
+        const projectId = payload.projectId as string;
         const escrow = await fundEscrow(projectId, ctx.senderId, ctx.chatId);
         return `🔒 Escrow funded — ${formatAmount(escrow.amount, escrow.currency)} locked.`;
       }
@@ -388,16 +411,63 @@ export async function dispatchAction(
           initiator: ctx.senderId,
           chatId: ctx.chatId,
         } as Parameters<typeof createPayrollBatch>[0]);
+
+        // Store batch ID in session context so YES/NO confirmation knows which batch
+        await prisma.chatSession.update({
+          where: { chatId: ctx.chatId },
+          data: { context: { pendingPayrollBatchId: batch.id } as object },
+        });
+
         return formatPayrollSummary(batch);
       }
 
+      case "CONFIRM_PAYROLL": {
+        const { batchId } = payload as { batchId: string };
+        const targetId = batchId || await (async () => {
+          const sess = await prisma.chatSession.findUnique({ where: { chatId: ctx.chatId } });
+          return (sess?.context as Record<string, string> | null)?.pendingPayrollBatchId ?? "";
+        })();
+        if (!targetId) return "⚠️ No pending payroll batch found.";
+        await confirmPayrollBatch(targetId, ctx.senderId);
+        return await processPayrollBatch(targetId, ctx.senderId);
+      }
+
+      case "PAYROLL_STATUS": {
+        const { batchCode } = payload as { batchCode: string };
+        if (!batchCode) return "⚠️ Please provide a batch code. Example: *PAYROLL STATUS PAY-20240101-XXXXX*";
+        return await getPayrollStatus(batchCode);
+      }
+
       case "UPDATE_PROJECT_STATUS": {
-        const { projectId, status } = payload as { projectId: string; status: string };
+        const { projectId: statusProjectId, status: rawStatus } = payload as {
+          projectId: string;
+          status: string;
+        };
+
+        // Map agent-generated statuses to valid ProjectStatus enum values
+        const STATUS_MAP: Record<string, string> = {
+          UNDER_REVIEW: "PENDING_APPROVAL",
+          REVIEW: "PENDING_APPROVAL",
+          AWAITING_APPROVAL: "PENDING_APPROVAL",
+          SUBMITTED: "PENDING_APPROVAL",
+        };
+
+        const VALID_STATUSES = [
+          "DRAFT", "ACTIVE", "FUNDED", "IN_PROGRESS",
+          "PENDING_APPROVAL", "COMPLETED", "DISPUTE", "CANCELLED",
+        ];
+
+        const resolvedStatus = STATUS_MAP[rawStatus] ?? rawStatus;
+        if (!VALID_STATUSES.includes(resolvedStatus)) {
+          logger.warn({ rawStatus, resolvedStatus }, "UPDATE_PROJECT_STATUS: invalid status, skipping");
+          return null;
+        }
+
         await prisma.project.update({
-          where: { id: projectId },
-          data: { status: status as never },
+          where: { id: statusProjectId },
+          data: { status: resolvedStatus as never },
         });
-        return `✅ Project status updated to ${status}`;
+        return null;
       }
 
       case "UPDATE_SESSION_STATE": {

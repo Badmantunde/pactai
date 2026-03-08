@@ -88,6 +88,9 @@ enum AuditAction {
   PAYROLL_CREATED
   PAYROLL_CONFIRMED
   PAYROLL_PROCESSED
+  PAYROLL_TRANSFER_INITIATED
+  ESCROW_PAYMENT_LINK_CREATED
+  ESCROW_TRANSFER_INITIATED
   CONFIRMATION_REQUESTED
   CONFIRMATION_RECEIVED
 }
@@ -162,6 +165,11 @@ model Escrow {
   fullyReleasedAt   DateTime?
   amountReleased    Int       @default(0)
 
+  // Flutterwave integration
+  flwPaymentLink    String?   // Payment link sent to client for funding
+  flwTxRef          String?   // Flutterwave transaction reference (funding)
+  flwTransferRef    String?   // Flutterwave transfer reference (release to freelancer)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -232,7 +240,11 @@ model PayrollEntry {
   accountNumber String
   bankName     String
   reference    String?
-  status       String       @default("PENDING") // PENDING | SENT | FAILED
+  status       String       @default("PENDING") // PENDING | PROCESSING | SENT | FAILED
+
+  // Flutterwave transfer tracking
+  flwTransferRef    String?   // Flutterwave transfer ID
+  flwTransferStatus String?   // NEW | PENDING | SUCCESSFUL | FAILED
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

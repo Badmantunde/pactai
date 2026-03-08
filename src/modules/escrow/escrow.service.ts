@@ -1,8 +1,80 @@
 import { EscrowStatus, ProjectStatus } from "@prisma/client";
+import { nanoid } from "nanoid";
 import { prisma } from "../../database";
 import { logAudit } from "../../utils/audit";
 import { formatAmount, DIVIDER } from "../../utils/formatters";
+import { config } from "../../config";
+import {
+  createPaymentLink,
+  initiateTransfer,
+  resolveBankCode,
+} from "../payment/flutterwave.service";
 
+/**
+ * Generate a Flutterwave payment link for the client to fund escrow.
+ * The project status is NOT changed here — it changes when the webhook confirms payment.
+ */
+export async function initiateEscrowFunding(
+  projectId: string,
+  actor: string,
+  chatId: string
+) {
+  const project = await prisma.project.findUniqueOrThrow({
+    where: { id: projectId },
+    include: { escrow: true },
+  });
+
+  if (!project.escrow) {
+    throw new Error("No escrow record found for this project. Ensure escrow is required.");
+  }
+
+  if (project.escrow.status !== "UNFUNDED") {
+    throw new Error(
+      `Escrow is already ${project.escrow.status}. Cannot re-initiate funding.`
+    );
+  }
+
+  // Amount in major units (Naira, not kobo)
+  const amountMajor = project.totalAmount / 100;
+
+  // Build a unique tx reference
+  const txRef = `escrow_${projectId}_${nanoid(8)}`;
+
+  const clientPhone = project.clientPhone;
+  const clientEmail = `client.${clientPhone}@pactai.app`; // synthetic email for Flutterwave
+
+  const { link } = await createPaymentLink({
+    txRef,
+    amount: amountMajor,
+    currency: project.currency,
+    customerEmail: clientEmail,
+    customerName: project.clientName ?? `Client +${clientPhone}`,
+    customerPhone: clientPhone,
+    description: `Pactai Escrow — ${project.name}`,
+    redirectUrl: `${config.APP_BASE_URL}/payment-complete`,
+    meta: { projectId, type: "escrow" },
+  });
+
+  // Save payment link + txRef on the escrow record
+  await prisma.escrow.update({
+    where: { projectId },
+    data: { flwPaymentLink: link, flwTxRef: txRef },
+  });
+
+  await logAudit({
+    action: "ESCROW_PAYMENT_LINK_CREATED",
+    actor,
+    projectId,
+    chatId,
+    details: { txRef, amount: amountMajor, currency: project.currency },
+  });
+
+  return { link, amount: project.totalAmount, currency: project.currency };
+}
+
+/**
+ * Mark escrow as funded (called by webhook after payment confirmed).
+ */
 export async function fundEscrow(
   projectId: string,
   actor: string,
@@ -83,6 +155,30 @@ export async function releaseMilestoneEscrow(
     );
   }
 
+  // Initiate Flutterwave transfer to freelancer
+  const transferRef = `escrow_release_${milestoneId}_${nanoid(8)}`;
+  const amountMajor = milestone.amount / 100;
+
+  let transferResult = null;
+  if (project.freelancerAccountNumber && project.freelancerBank) {
+    const bankCode = resolveBankCode(project.freelancerBank);
+    try {
+      transferResult = await initiateTransfer({
+        accountNumber: project.freelancerAccountNumber,
+        bankCode,
+        amount: amountMajor,
+        currency: project.currency,
+        narration: `Pactai: ${project.name} — Milestone ${milestone.title}`,
+        reference: transferRef,
+        callbackUrl: `${config.APP_BASE_URL}/webhooks/flutterwave`,
+      });
+    } catch (err) {
+      // Log but don't block — admin can manually retry
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Transfer initiation failed: ${msg}. Contact admin.`);
+    }
+  }
+
   const updatedMilestone = await prisma.milestone.update({
     where: { id: milestoneId },
     data: { status: "RELEASED", releasedAt: new Date() },
@@ -104,6 +200,7 @@ export async function releaseMilestoneEscrow(
       lastReleasedAt: new Date(),
       fullyReleasedAt:
         newStatus === EscrowStatus.FULLY_RELEASED ? new Date() : null,
+      flwTransferRef: transferResult?.reference ?? transferRef,
     },
   });
 
@@ -123,6 +220,7 @@ export async function releaseMilestoneEscrow(
       amountReleased: milestone.amount,
       currency: project.currency,
       totalReleased: newAmountReleased,
+      transferRef,
     },
   });
 
@@ -136,12 +234,35 @@ export async function releaseFullEscrow(
 ) {
   const project = await prisma.project.findUniqueOrThrow({
     where: { id: projectId },
+    include: { escrow: true },
   });
 
   if (project.status === ProjectStatus.DISPUTE) {
     throw new Error(
       "⚖️ Cannot release escrow — project is currently in DISPUTE mode."
     );
+  }
+
+  // Initiate Flutterwave transfer to freelancer
+  const transferRef = `escrow_release_full_${projectId}_${nanoid(8)}`;
+  const amountMajor = project.totalAmount / 100;
+
+  if (project.freelancerAccountNumber && project.freelancerBank) {
+    const bankCode = resolveBankCode(project.freelancerBank);
+    try {
+      await initiateTransfer({
+        accountNumber: project.freelancerAccountNumber,
+        bankCode,
+        amount: amountMajor,
+        currency: project.currency,
+        narration: `Pactai: ${project.name} — Full Payment`,
+        reference: transferRef,
+        callbackUrl: `${config.APP_BASE_URL}/webhooks/flutterwave`,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Transfer initiation failed: ${msg}. Contact admin.`);
+    }
   }
 
   const escrow = await prisma.escrow.update({
@@ -151,6 +272,7 @@ export async function releaseFullEscrow(
       amountReleased: project.totalAmount,
       lastReleasedAt: new Date(),
       fullyReleasedAt: new Date(),
+      flwTransferRef: transferRef,
     },
   });
 
@@ -167,6 +289,7 @@ export async function releaseFullEscrow(
     details: {
       amount: project.totalAmount,
       currency: project.currency,
+      transferRef,
     },
   });
 
