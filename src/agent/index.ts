@@ -4,6 +4,9 @@ import { PACTAI_SYSTEM_PROMPT } from "./system-prompt";
 import { logger } from "../utils/logger";
 import { prisma } from "../database";
 import { getWallet, getDefaultAccount } from "../modules/wallet/wallet.service";
+import { verifyTransaction } from "../modules/payment/flutterwave.service";
+import { fundEscrow } from "../modules/escrow/escrow.service";
+import { sendMessage } from "../whatsapp/client";
 
 const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
 
@@ -63,6 +66,37 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
       orderBy: { createdAt: "desc" },
     }),
   ]);
+
+  // Auto-verify escrow payment — if unfunded but a payment link was generated,
+  // check Flutterwave right now. Catches cases where the redirect/webhook never fired.
+  if (escrowData && escrowData.status === "UNFUNDED" && escrowData.flwTxRef) {
+    try {
+      const verification = await verifyTransaction(escrowData.flwTxRef);
+      if (verification.verified) {
+        logger.info({ projectId: session.projectId }, "Auto-verify: payment confirmed, funding escrow");
+        await fundEscrow(session.projectId!, "AUTO_VERIFY", chatId);
+
+        // Reload escrow so the agent sees FUNDED status in this turn
+        const fresh = await prisma.escrow.findUnique({ where: { projectId: session.projectId! } });
+        if (fresh) Object.assign(escrowData, fresh);
+
+        // Notify the group if this is a group chat
+        if (chatId.endsWith("@g.us")) {
+          const project = await prisma.project.findUnique({ where: { id: session.projectId! } });
+          if (project) {
+            await sendMessage(
+              chatId,
+              `🔒 *Escrow Confirmed — ${project.name}*\n\n` +
+              `✅ Payment has been verified. Escrow is now funded!\n\n` +
+              `📌 *${project.freelancerName}* — type *START PROJECT* to officially begin.`
+            );
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, "Auto-verify escrow: Flutterwave check failed (will retry next message)");
+    }
+  }
 
   // Build context block for the current turn
   const contextBlock = {
