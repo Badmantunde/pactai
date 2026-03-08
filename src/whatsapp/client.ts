@@ -65,8 +65,13 @@ export async function initWhatsApp(
 
     // Show QR
     if (qr) {
-      console.log("\n📱 Scan this QR with WhatsApp\n");
-      qrcode.generate(qr, { small: false });
+      console.log("\n========== WHATSAPP QR CODE ==========");
+      qrcode.generate(qr, { small: true });
+      // Also log a browser URL in case the terminal QR is distorted
+      const encoded = encodeURIComponent(qr);
+      console.log("\n📱 If the QR above is unreadable, open this URL in your browser:");
+      console.log(`https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encoded}`);
+      console.log("======================================\n");
     }
 
     if (connection === "open") {
