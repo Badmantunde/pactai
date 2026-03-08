@@ -66,7 +66,7 @@ export async function initWhatsApp(
     // Show QR
     if (qr) {
       console.log("\n📱 Scan this QR with WhatsApp\n");
-      qrcode.generate(qr, { small: true });
+      qrcode.generate(qr, { small: false });
     }
 
     if (connection === "open") {
