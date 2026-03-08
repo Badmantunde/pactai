@@ -7,7 +7,6 @@
  */
 
 import axios from "axios";
-import crypto from "crypto";
 import { config } from "../../config";
 import { logger } from "../../utils/logger";
 
@@ -201,14 +200,12 @@ export async function verifyTransaction(txRef: string): Promise<{
 // ─── Webhook signature verification ──────────────────────────────────────────
 
 export function verifyWebhookSignature(
-  body: string,
+  _body: string,
   receivedHash: string
 ): boolean {
-  const expected = crypto
-    .createHmac("sha256", config.FLUTTERWAVE_WEBHOOK_SECRET)
-    .update(body)
-    .digest("hex");
-  return expected === receivedHash;
+  // Flutterwave sends the raw secret as the verif-hash header — NOT an HMAC digest.
+  // Simply compare the received value to our stored secret.
+  return receivedHash === config.FLUTTERWAVE_WEBHOOK_SECRET;
 }
 
 // ─── Bulk transfer (payroll) ──────────────────────────────────────────────────
