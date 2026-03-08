@@ -21,15 +21,46 @@ export function createServer() {
     res.json({ status: "ok", service: "pactai" });
   });
 
-  // ── Flutterwave webhook ─────────────────────────────────────────────────────
-  // Flutterwave sends the webhook as JSON with a verif-hash header.
-  // We respond 200 immediately, then process async — prevents Flutterwave retries.
+  // ── Payment redirect (primary trigger) ─────────────────────────────────────
+  // After the client pays on Flutterwave, they are redirected here with:
+  //   ?status=successful&tx_ref=escrow_<projectId>_<nonce>&transaction_id=<id>
+  // This is MORE reliable than webhooks because it fires immediately on payment.
+  app.get("/payment-complete", (req, res) => {
+    const { status, tx_ref } = req.query as Record<string, string>;
+    logger.info({ status, tx_ref }, "FLW payment redirect received");
+
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pactai — Payment Received</title>
+<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f0fdf4}
+.card{background:#fff;border-radius:16px;padding:40px 32px;text-align:center;max-width:400px;box-shadow:0 4px 24px rgba(0,0,0,.08)}
+h1{color:#16a34a;font-size:2rem;margin:0 0 8px}p{color:#555;margin:8px 0}
+.sub{font-size:.9rem;color:#888;margin-top:16px}</style></head>
+<body><div class="card">
+<h1>✅ Payment Received!</h1>
+<p><strong>Escrow has been funded.</strong></p>
+<p>Your project group on WhatsApp will be notified automatically.</p>
+<p class="sub">You can close this page and return to WhatsApp.</p>
+</div></body></html>`);
+
+    // Process async — do not block the redirect response
+    if (status === "successful" && tx_ref?.startsWith("escrow_")) {
+      handleEscrowPayment(tx_ref).catch((err) => {
+        logger.error({ err, tx_ref }, "Payment redirect handler error");
+      });
+    }
+  });
+
+  // ── Flutterwave webhook (secondary / backup trigger) ─────────────────────
+  // Flutterwave also sends a POST webhook. We handle both so either path works.
   app.post(
     "/webhooks/flutterwave",
     express.raw({ type: "application/json" }),
     (req, res) => {
       const rawBody = req.body as Buffer;
       const receivedHash = req.headers["verif-hash"] as string | undefined;
+
+      logger.info({ receivedHash: receivedHash ? "present" : "missing" }, "FLW webhook hit");
 
       if (!receivedHash) {
         logger.warn("FLW webhook: missing verif-hash header");
@@ -38,7 +69,7 @@ export function createServer() {
       }
 
       if (!verifyWebhookSignature(rawBody.toString(), receivedHash)) {
-        logger.warn("FLW webhook: invalid signature");
+        logger.warn({ receivedHash }, "FLW webhook: invalid signature — check FLUTTERWAVE_WEBHOOK_SECRET");
         res.status(401).send("Invalid signature");
         return;
       }
@@ -68,6 +99,86 @@ export function createServer() {
   return app;
 }
 
+// ─── Shared: handle a confirmed escrow payment by txRef ──────────────────────
+
+async function handleEscrowPayment(txRef: string) {
+  // txRef format: escrow_<projectId>_<nonce>
+  const parts = txRef.split("_");
+  // parts[0] = "escrow", parts[1] = projectId (no underscores in cuid)
+  const projectId = parts[1];
+  if (!projectId) {
+    logger.warn({ txRef }, "handleEscrowPayment: cannot extract projectId from txRef");
+    return;
+  }
+
+  // Load project and escrow
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    include: { escrow: true },
+  });
+
+  if (!project || !project.escrow) {
+    logger.warn({ projectId, txRef }, "handleEscrowPayment: project/escrow not found");
+    return;
+  }
+
+  if (project.escrow.status !== "UNFUNDED") {
+    logger.info({ projectId }, "handleEscrowPayment: escrow already funded, skipping");
+    return;
+  }
+
+  // Verify with Flutterwave API to confirm the payment is genuine
+  const verification = await verifyTransaction(txRef);
+  if (!verification.verified) {
+    logger.warn({ txRef }, "handleEscrowPayment: Flutterwave verification failed");
+    return;
+  }
+
+  // Mark escrow as funded in DB
+  await fundEscrow(projectId, "SYSTEM", project.groupChatId ?? projectId);
+
+  // Save flw ref
+  await prisma.escrow.update({
+    where: { projectId },
+    data: { flwTxRef: verification.flwRef },
+  });
+
+  const amount = formatAmount(project.totalAmount, project.currency);
+
+  const groupAnnouncement =
+    `🔒 *Escrow Funded — Project Cleared to Start!*\n` +
+    DIVIDER + "\n" +
+    `📋 *${project.name}*\n` +
+    `👤 Freelancer: ${project.freelancerName}\n` +
+    `👤 Client: ${project.clientName ?? `+${project.clientPhone}`}\n` +
+    `💰 Locked in Escrow: ${amount}\n` +
+    `📅 Deadline: ${formatDate(project.deadline)}\n` +
+    DIVIDER + "\n\n" +
+    `✅ Payment has been received and is securely locked.\n` +
+    `It will be released automatically once the client approves the deliverables.\n\n` +
+    `📌 *${project.freelancerName}* — you're good to go!\n` +
+    `Type *START PROJECT* to officially commence work and log the start date.`;
+
+  if (project.groupChatId) {
+    await sendMessage(project.groupChatId, groupAnnouncement);
+  }
+
+  if (project.freelancerPhone) {
+    await sendMessage(
+      `${project.freelancerPhone}@s.whatsapp.net`,
+      `🔔 *Escrow funded for "${project.name}"!*\n\n` +
+      `${amount} is now locked and waiting for you.\n` +
+      `Head to the project group and type *START PROJECT* to begin.`
+    );
+  }
+
+  if (!project.groupChatId && project.clientPhone) {
+    await sendMessage(`${project.clientPhone}@s.whatsapp.net`, groupAnnouncement);
+  }
+
+  logger.info({ projectId, txRef }, "Escrow funded and group notified");
+}
+
 // ─── Webhook event handler ───────────────────────────────────────────────────
 
 async function handleFlwEvent(
@@ -83,86 +194,9 @@ async function handleFlwEvent(
     const txRef = data["tx_ref"] as string | undefined;
 
     if (status !== "successful" || !txRef) return;
-
-    // txRef format: escrow_<projectId>_<nonce>
     if (!txRef.startsWith("escrow_")) return;
 
-    const projectId = txRef.split("_")[1];
-    if (!projectId) return;
-
-    // Verify with Flutterwave to prevent spoofed webhooks
-    const verification = await verifyTransaction(txRef);
-    if (!verification.verified) {
-      logger.warn({ txRef }, "FLW payment webhook: verification failed");
-      return;
-    }
-
-    // Load project and escrow
-    const project = await prisma.project.findUnique({
-      where: { id: projectId },
-      include: { escrow: true },
-    });
-
-    if (!project || !project.escrow) {
-      logger.warn({ projectId }, "FLW webhook: project/escrow not found");
-      return;
-    }
-
-    if (project.escrow.status !== "UNFUNDED") {
-      logger.info({ projectId }, "FLW webhook: escrow already funded, skipping");
-      return;
-    }
-
-    // Mark escrow as funded
-    await fundEscrow(projectId, "SYSTEM", project.groupChatId ?? projectId);
-
-    // Save flw ref
-    await prisma.escrow.update({
-      where: { projectId },
-      data: { flwTxRef: verification.flwRef },
-    });
-
-    const amount = formatAmount(project.totalAmount, project.currency);
-
-    const groupAnnouncement =
-      `🔒 *Escrow Funded — Project Cleared to Start!*\n` +
-      DIVIDER + "\n" +
-      `📋 *${project.name}*\n` +
-      `👤 Freelancer: ${project.freelancerName}\n` +
-      `👤 Client: ${project.clientName ?? `+${project.clientPhone}`}\n` +
-      `💰 Locked in Escrow: ${amount}\n` +
-      `📅 Deadline: ${formatDate(project.deadline)}\n` +
-      DIVIDER + "\n\n" +
-      `✅ Payment has been received and is securely locked.\n` +
-      `It will be released automatically once the client approves the deliverables.\n\n` +
-      `📌 *${project.freelancerName}* — you're good to go!\n` +
-      `Type *START PROJECT* to officially commence work and log the start date.`;
-
-    // Send to group if it exists
-    if (project.groupChatId) {
-      await sendMessage(project.groupChatId, groupAnnouncement);
-    }
-
-    // Also send a direct nudge to the freelancer's private chat
-    if (project.freelancerPhone) {
-      const freelancerJid = `${project.freelancerPhone}@s.whatsapp.net`;
-      await sendMessage(
-        freelancerJid,
-        `🔔 *Escrow funded for "${project.name}"!*\n\n` +
-        `${amount} is now locked and waiting for you.\n` +
-        `Head to the project group and type *START PROJECT* to begin.`
-      );
-    }
-
-    // Fallback: if no group yet, notify client directly
-    if (!project.groupChatId && project.clientPhone) {
-      await sendMessage(
-        `${project.clientPhone}@s.whatsapp.net`,
-        groupAnnouncement
-      );
-    }
-
-    logger.info({ projectId, txRef }, "Escrow funded via Flutterwave webhook");
+    await handleEscrowPayment(txRef);
   }
 
   // ── Transfer status update (escrow release / payroll) ────────────────────────
