@@ -43,5 +43,5 @@ COPY --from=builder /app/dist ./dist
 
 EXPOSE 3000
 
-# Run DB migration then start the app
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+# Push schema to DB with retry (Railway DB proxy may take a few seconds to wake up)
+CMD ["sh", "-c", "until npx prisma db push --accept-data-loss; do echo 'DB not ready, retrying in 5s...'; sleep 5; done && node dist/index.js"]
