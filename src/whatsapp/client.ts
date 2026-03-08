@@ -76,6 +76,10 @@ export async function initWhatsApp(
 
     if (connection === "open") {
       logger.info("✅ WhatsApp connected successfully");
+      // Set professional display name so users see "PactAi" instead of phone number
+      sock?.updateProfileName("PactAi").catch((err) => {
+        logger.warn({ err }, "Could not update WhatsApp profile name");
+      });
     }
 
     if (connection === "close") {
