@@ -108,19 +108,26 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     // Active project (the one last worked on in this chat)
     activeProjectId: session.projectId ?? null,
     escrow: escrowData
-      ? { status: escrowData.status, amount: escrowData.amount, amountReleased: escrowData.amountReleased }
+      ? {
+          status: escrowData.status,
+          // Divide by 100: DB stores kobo/cents, AI must work in major units (Naira/USD)
+          amount: escrowData.amount / 100,
+          amountReleased: escrowData.amountReleased / 100,
+          currency: escrowData.currency,
+        }
       : null,
-    // All active projects for this user
     projects: userProjects.map((p) => ({
       id: p.id,
       name: p.name,
       status: p.status,
       clientName: p.clientName,
       clientPhone: p.clientPhone,
-      totalAmount: p.totalAmount,
+      // Divide by 100: DB stores kobo/cents, AI must work in major units (Naira/USD)
+      totalAmount: p.totalAmount / 100,
       currency: p.currency,
       deadline: p.deadline,
       escrowStatus: p.escrow?.status ?? null,
+      escrowAmount: p.escrow ? p.escrow.amount / 100 : null,
       isActive: p.id === session.projectId,
     })),
     wallet: {

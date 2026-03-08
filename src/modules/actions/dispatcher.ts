@@ -555,10 +555,31 @@ export async function dispatchAction(
           return null;
         }
 
+        const now = new Date();
         await prisma.project.update({
           where: { id: statusProjectId },
-          data: { status: resolvedStatus as never },
+          data: {
+            status: resolvedStatus as never,
+            ...(resolvedStatus === "IN_PROGRESS" ? { startedAt: now } : {}),
+          },
         });
+
+        // Announce exact start time in the group
+        if (resolvedStatus === "IN_PROGRESS" && ctx.chatId.endsWith("@g.us")) {
+          const startedProject = await prisma.project.findUnique({ where: { id: statusProjectId } });
+          if (startedProject) {
+            const dateStr = now.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric", timeZone: "Africa/Lagos" });
+            const timeStr = now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos" });
+            await sendMessage(
+              ctx.chatId,
+              `🚀 *Project Commenced!*\n` +
+              `📋 *${startedProject.name}*\n` +
+              `📅 Date: ${dateStr}\n` +
+              `🕐 Time: ${timeStr} (WAT)\n\n` +
+              `Work is now officially underway. The clock is ticking ⏱️`
+            );
+          }
+        }
         return null;
       }
 

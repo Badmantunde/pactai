@@ -114,6 +114,7 @@ model Project {
   toolsRequired           String[]      // tools/deliverables for the project
   escrowRequired  Boolean       @default(true)
   status          ProjectStatus @default(DRAFT)
+  startedAt       DateTime?     // when work officially commenced (IN_PROGRESS)
   groupChatId     String?       // WhatsApp group chat ID
   invoiceId       String?
 
