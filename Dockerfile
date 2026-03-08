@@ -2,6 +2,9 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# OpenSSL is required by Prisma's migration engine
+RUN apk add --no-cache openssl
+
 # Install dependencies first (better layer caching)
 COPY package*.json ./
 COPY prisma ./prisma/
@@ -20,6 +23,9 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
+
+# OpenSSL is required by Prisma at runtime
+RUN apk add --no-cache openssl
 
 # Only install production dependencies
 COPY package*.json ./
