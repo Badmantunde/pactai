@@ -23,41 +23,42 @@ export function createServer() {
 
   // ── Flutterwave webhook ─────────────────────────────────────────────────────
   // Flutterwave sends the webhook as JSON with a verif-hash header.
+  // We respond 200 immediately, then process async — prevents Flutterwave retries.
   app.post(
     "/webhooks/flutterwave",
     express.raw({ type: "application/json" }),
-    async (req, res) => {
+    (req, res) => {
       const rawBody = req.body as Buffer;
       const receivedHash = req.headers["verif-hash"] as string | undefined;
 
       if (!receivedHash) {
         logger.warn("FLW webhook: missing verif-hash header");
-        return res.status(400).send("Missing signature");
+        res.status(400).send("Missing signature");
+        return;
       }
 
       if (!verifyWebhookSignature(rawBody.toString(), receivedHash)) {
         logger.warn("FLW webhook: invalid signature");
-        return res.status(401).send("Invalid signature");
+        res.status(401).send("Invalid signature");
+        return;
       }
 
       let event: Record<string, unknown>;
       try {
         event = JSON.parse(rawBody.toString()) as Record<string, unknown>;
       } catch {
-        return res.status(400).send("Invalid JSON");
+        res.status(400).send("Invalid JSON");
+        return;
       }
 
       const eventType = event["event"] as string | undefined;
       logger.info({ eventType }, "FLW webhook received");
 
-      try {
-        await handleFlwEvent(eventType ?? "", event);
-      } catch (err) {
+      // Respond 200 immediately, then process async
+      res.status(200).send("OK");
+      handleFlwEvent(eventType ?? "", event).catch((err) => {
         logger.error({ err }, "FLW webhook handler error");
-      }
-
-      // Always return 200 immediately so Flutterwave doesn't retry
-      return res.status(200).send("OK");
+      });
     }
   );
 
@@ -83,7 +84,7 @@ async function handleFlwEvent(
 
     if (status !== "successful" || !txRef) return;
 
-    // txRef format: escrow_<projectId>_<timestamp>
+    // txRef format: escrow_<projectId>_<nonce>
     if (!txRef.startsWith("escrow_")) return;
 
     const projectId = txRef.split("_")[1];
@@ -174,7 +175,7 @@ async function handleFlwEvent(
 
 export async function startServer() {
   const app = createServer();
-  const port = config.PORT;
+  const port = process.env.PORT ? Number(process.env.PORT) : config.PORT;
 
   await new Promise<void>((resolve) => {
     app.listen(port, "0.0.0.0", () => {
