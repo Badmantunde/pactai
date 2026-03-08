@@ -189,7 +189,10 @@ async function handleFlwEvent(
   if (!data) return;
 
   // ── Payment confirmed (escrow funding) ──────────────────────────────────────
-  if (eventType === "charge.completed") {
+  if (
+  eventType === "charge.completed" ||
+  eventType === "payment.completed"
+) {
     const status = data["status"] as string;
     const txRef = data["tx_ref"] as string | undefined;
 
